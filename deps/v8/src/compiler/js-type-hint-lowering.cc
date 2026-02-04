@@ -427,6 +427,7 @@ JSTypeHintLowering::LoweringResult JSTypeHintLowering::ReduceUnaryOperation(
       TypeOfFeedback::Result hint = broker()->GetFeedbackForTypeOf(feedback);
       switch (hint) {
         case TypeOfFeedback::kNumber:
+        case TypeOfFeedback::kSmi:
           check = jsgraph()->graph()->NewNode(
               jsgraph()->simplified()->CheckNumber(FeedbackSource()), operand,
               effect, control);
@@ -535,6 +536,27 @@ JSTypeHintLowering::LoweringResult JSTypeHintLowering::ReduceBinaryOperation(
         if (Node* node = b.TryBuildBigIntBinop()) {
           return LoweringResult::SideEffectFree(node, node, control);
         }
+      }
+      break;
+    }
+    default:
+      UNREACHABLE();
+  }
+  return LoweringResult::NoChange();
+}
+
+JSTypeHintLowering::LoweringResult
+JSTypeHintLowering::ReduceBinaryOperationWithEmbeddedHint(const Operator* op,
+                                                          Node* left,
+                                                          Node* right,
+                                                          Node* effect,
+                                                          Node* control) const {
+  switch (op->opcode()) {
+    case IrOpcode::kJSStrictEqual: {
+      if (Node* node = BuildDeoptIfFeedbackIsInsufficient(
+              EmbeddedHintParameterOf(op), effect, control,
+              DeoptimizeReason::kInsufficientTypeFeedbackForBinaryOperation)) {
+        return LoweringResult::Exit(node);
       }
       break;
     }
@@ -676,6 +698,35 @@ Node* JSTypeHintLowering::BuildDeoptIfFeedbackIsInsufficient(
 
   Node* deoptimize = jsgraph()->graph()->NewNode(
       jsgraph()->common()->Deoptimize(reason, FeedbackSource()),
+      jsgraph()->Dead(), effect, control);
+  Node* frame_state =
+      NodeProperties::FindFrameStateBefore(deoptimize, jsgraph()->Dead());
+  deoptimize->ReplaceInput(0, frame_state);
+  return deoptimize;
+}
+
+Node* JSTypeHintLowering::BuildDeoptIfFeedbackIsInsufficient(
+    const EmbeddedHintParameter& embedded_hint, Node* effect, Node* control,
+    DeoptimizeReason reason) const {
+  if (!(flags() & kBailoutOnUninitialized)) return nullptr;
+
+  bool feedback_is_sufficient = std::visit(
+      [](auto const& h) {
+        using T = std::decay_t<decltype(h)>;
+        if constexpr (std::is_same_v<T, CompareOperationHint>) {
+          return h != CompareOperationHint::kNone;
+        } else {
+          UNREACHABLE();
+        }
+      },
+      embedded_hint.hint());
+
+  if (feedback_is_sufficient) return nullptr;
+
+  Node* deoptimize = jsgraph()->graph()->NewNode(
+      jsgraph()->common()->Deoptimize(
+          DeoptimizeReason::kInsufficientTypeFeedbackForCompareOperation,
+          FeedbackSource()),
       jsgraph()->Dead(), effect, control);
   Node* frame_state =
       NodeProperties::FindFrameStateBefore(deoptimize, jsgraph()->Dead());

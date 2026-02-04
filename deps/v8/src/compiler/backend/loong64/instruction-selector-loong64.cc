@@ -1540,24 +1540,32 @@ static Instruction* VisitCompare(InstructionSelector* selector,
                                  InstructionOperand left,
                                  InstructionOperand right,
                                  FlagsContinuation* cont) {
+  Loong64OperandGenerator g(selector);
+  InstructionOperand inputs[4];
+  size_t input_count = 0;
+  inputs[input_count++] = left;
+  inputs[input_count++] = right;
+  if (cont->IsSelect()) {
+    inputs[input_count++] = g.UseRegisterOrImmediateZero(cont->true_value());
+    inputs[input_count++] = g.UseRegisterOrImmediateZero(cont->false_value());
+  }
 #ifdef V8_COMPRESS_POINTERS
   if (opcode == kLoong64Cmp32) {
-    Loong64OperandGenerator g(selector);
-    InstructionOperand inputs[] = {left, right};
     if (right.IsImmediate()) {
       InstructionOperand temps[1] = {g.TempRegister()};
-      return selector->EmitWithContinuation(opcode, 0, nullptr,
-                                            arraysize(inputs), inputs,
-                                            arraysize(temps), temps, cont);
+      return selector->EmitWithContinuation(opcode, 0, nullptr, input_count,
+                                            inputs, arraysize(temps), temps,
+                                            cont);
     } else {
       InstructionOperand temps[2] = {g.TempRegister(), g.TempRegister()};
-      return selector->EmitWithContinuation(opcode, 0, nullptr,
-                                            arraysize(inputs), inputs,
-                                            arraysize(temps), temps, cont);
+      return selector->EmitWithContinuation(opcode, 0, nullptr, input_count,
+                                            inputs, arraysize(temps), temps,
+                                            cont);
     }
   }
 #endif
-  return selector->EmitWithContinuation(opcode, left, right, cont);
+  return selector->EmitWithContinuation(opcode, 0, nullptr, input_count, inputs,
+                                        cont);
 }
 
 // Shared routine for multiple float32 compare operations.
@@ -2087,28 +2095,24 @@ void InstructionSelector::VisitWordCompareZero(OpIndex user, OpIndex value,
           // actual value, or was already defined, which means it is scheduled
           // *AFTER* this branch).
           OpIndex node = projection->input();
-          OptionalOpIndex result = FindProjection(node, 0);
-          if (!result.valid() || IsDefined(result.value())) {
-            if (const OverflowCheckedBinopOp* binop =
-                    TryCast<OverflowCheckedBinopOp>(node)) {
-              const bool is64 = binop->rep == WordRepresentation::Word64();
-              switch (binop->kind) {
-                case OverflowCheckedBinopOp::Kind::kSignedAdd:
-                  cont->OverwriteAndNegateIfEqual(kOverflow);
-                  return VisitBinop(this, node,
-                                    is64 ? kLoong64AddOvf_d : kLoong64Add_d,
-                                    cont);
-                case OverflowCheckedBinopOp::Kind::kSignedSub:
-                  cont->OverwriteAndNegateIfEqual(kOverflow);
-                  return VisitBinop(this, node,
-                                    is64 ? kLoong64SubOvf_d : kLoong64Sub_d,
-                                    cont);
-                case OverflowCheckedBinopOp::Kind::kSignedMul:
-                  cont->OverwriteAndNegateIfEqual(kOverflow);
-                  return VisitBinop(this, node,
-                                    is64 ? kLoong64MulOvf_d : kLoong64MulOvf_w,
-                                    cont);
-              }
+          if (const OverflowCheckedBinopOp* binop =
+                  TryCast<OverflowCheckedBinopOp>(node);
+              binop && CanDoBranchIfOverflowFusion(node)) {
+            const bool is64 = binop->rep == WordRepresentation::Word64();
+            switch (binop->kind) {
+              case OverflowCheckedBinopOp::Kind::kSignedAdd:
+                cont->OverwriteAndNegateIfEqual(kOverflow);
+                return VisitBinop(
+                    this, node, is64 ? kLoong64AddOvf_d : kLoong64Add_d, cont);
+              case OverflowCheckedBinopOp::Kind::kSignedSub:
+                cont->OverwriteAndNegateIfEqual(kOverflow);
+                return VisitBinop(
+                    this, node, is64 ? kLoong64SubOvf_d : kLoong64Sub_d, cont);
+              case OverflowCheckedBinopOp::Kind::kSignedMul:
+                cont->OverwriteAndNegateIfEqual(kOverflow);
+                return VisitBinop(this, node,
+                                  is64 ? kLoong64MulOvf_d : kLoong64MulOvf_w,
+                                  cont);
             }
           }
         }
@@ -2945,7 +2949,7 @@ void InstructionSelector::VisitSignExtendWord32ToInt64(OpIndex node) {
 void InstructionSelector::AddOutputToSelectContinuation(OperandGenerator* g,
                                                         int first_input_index,
                                                         OpIndex node) {
-  UNREACHABLE();
+  continuation_outputs_.push_back(g->DefineAsRegister(node));
 }
 
 // static
@@ -2962,7 +2966,8 @@ InstructionSelector::SupportedMachineOperatorFlags() {
          MachineOperatorBuilder::kFloat64RoundTruncate |
          MachineOperatorBuilder::kFloat32RoundTruncate |
          MachineOperatorBuilder::kFloat64RoundTiesEven |
-         MachineOperatorBuilder::kFloat32RoundTiesEven;
+         MachineOperatorBuilder::kFloat32RoundTiesEven |
+         MachineOperatorBuilder::kWord64Select;
 }
 
 // static

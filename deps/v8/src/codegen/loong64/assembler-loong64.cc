@@ -20,16 +20,10 @@ namespace internal {
 bool CpuFeatures::SupportsWasmSimd128() { return false; }
 
 void CpuFeatures::ProbeImpl(bool cross_compile) {
-  supported_ |= 1u << FPU;
+  supported_.Add(FPU);
 
   // Only use statically determined features for cross compile (snapshot).
   if (cross_compile) return;
-
-#ifdef __loongarch__
-  // Probe for additional features at runtime.
-  base::CPU cpu;
-  supported_ |= 1u << FPU;
-#endif
 
   // Set a static value on whether Simd is supported.
   // This variable is only used for certain archs to query SupportWasmSimd128()
@@ -115,8 +109,8 @@ uint32_t RelocInfo::wasm_call_tag() const {
 // Implementation of Operand and MemOperand.
 // See assembler-loong64-inl.h for inlined constructors.
 
-Operand::Operand(Handle<HeapObject> handle)
-    : rm_(no_reg), rmode_(RelocInfo::FULL_EMBEDDED_OBJECT) {
+Operand::Operand(Handle<HeapObject> handle, RelocInfo::Mode rmode)
+    : rm_(no_reg), rmode_(rmode) {
   value_.immediate = static_cast<intptr_t>(handle.address());
 }
 
@@ -152,7 +146,7 @@ Assembler::Assembler(const AssemblerOptions& options,
                      std::unique_ptr<AssemblerBuffer> buffer)
     : AssemblerBase(options, std::move(buffer)),
       scratch_register_list_({t6, t7, t8}),
-      scratch_fpregister_list_({f31}) {
+      scratch_fpregister_list_({f27, f28}) {
   reloc_info_writer.Reposition(buffer_start_ + buffer_->size(), pc_);
 
   last_trampoline_pool_end_ = 0;

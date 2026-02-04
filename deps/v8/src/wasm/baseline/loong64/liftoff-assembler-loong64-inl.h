@@ -5,11 +5,12 @@
 #ifndef V8_WASM_BASELINE_LOONG64_LIFTOFF_ASSEMBLER_LOONG64_INL_H_
 #define V8_WASM_BASELINE_LOONG64_LIFTOFF_ASSEMBLER_LOONG64_INL_H_
 
+#include "src/codegen/atomic-memory-order.h"
 #include "src/codegen/interface-descriptors-inl.h"
 #include "src/codegen/loong64/assembler-loong64-inl.h"
 #include "src/codegen/machine-type.h"
 #include "src/compiler/linkage.h"
-#include "src/heap/mutable-page-metadata.h"
+#include "src/heap/mutable-page.h"
 #include "src/wasm/baseline/liftoff-assembler.h"
 #include "src/wasm/baseline/parallel-move-inl.h"
 #include "src/wasm/object-access.h"
@@ -421,6 +422,7 @@ Register LiftoffAssembler::LoadOldFramePointer() {
   }
 
   LiftoffRegister old_fp = GetUnusedRegister(RegClass::kGpReg, {});
+  FreezeCacheState frozen(*this);
   Label done, call_runtime;
   Ld_d(old_fp.gp(), MemOperand(fp, TypedFrameConstants::kFrameTypeOffset));
   BranchShort(
@@ -533,21 +535,11 @@ void LiftoffAssembler::LoadTaggedPointer(Register dst, Register src_addr,
   unsigned shift_amount = !needs_shift ? 0 : COMPRESS_POINTERS_BOOL ? 2 : 3;
   MemOperand src_op = liftoff::GetMemOp(this, src_addr, offset_reg, offset_imm,
                                         false, shift_amount);
-  {
-    BlockTrampolinePoolScope block_trampoline_pool(this);
-    LoadTaggedField(dst, src_op);
-
-    // Since LoadTaggedField might start with an instruction loading an
-    // immediate argument to a register, we have to compute the
-    // {protected_load_pc} after calling it. In case of compressed pointers,
-    // there is an additional instruction (pointer decompression) after the
-    // load.
-    uint8_t protected_instruction_offset_bias =
-        COMPRESS_POINTERS_BOOL ? 2 * kInstrSize : kInstrSize;
-    if (protected_load_pc) {
-      *protected_load_pc = pc_offset() - protected_instruction_offset_bias;
-    }
-  }
+  LoadTaggedField(dst, src_op, reinterpret_cast<int*>(protected_load_pc));
+  DCHECK_IMPLIES(protected_load_pc != nullptr,
+                 Instruction::At(reinterpret_cast<uint8_t*>(*protected_load_pc +
+                                                            buffer_start_))
+                     ->IsLoad());
 }
 
 void LiftoffAssembler::LoadProtectedPointer(Register dst, Register src_addr,
@@ -592,21 +584,17 @@ void LiftoffAssembler::StoreTaggedPointer(Register dst_addr,
     offset_op = Operand(effective_offset);
   }
 
-  {
-    BlockTrampolinePoolScope block_trampoline_pool(this);
-    if (offset_op.is_reg()) {
-      StoreTaggedField(src, MemOperand(dst_addr, offset_op.rm()));
-    } else {
-      StoreTaggedField(src, MemOperand(dst_addr, offset_imm));
-    }
-
-    // Since StoreTaggedField might start with an instruction loading an
-    // immediate argument to a register, we have to compute the
-    // {protected_load_pc} after calling it.
-    if (protected_store_pc) {
-      *protected_store_pc = pc_offset() - kInstrSize;
-    }
+  if (offset_op.is_reg()) {
+    StoreTaggedField(src, MemOperand(dst_addr, offset_op.rm()),
+                     reinterpret_cast<int*>(protected_store_pc));
+  } else {
+    StoreTaggedField(src, MemOperand(dst_addr, offset_imm),
+                     reinterpret_cast<int*>(protected_store_pc));
   }
+  DCHECK_IMPLIES(protected_store_pc != nullptr,
+                 Instruction::At(reinterpret_cast<uint8_t*>(
+                                     *protected_store_pc + buffer_start_))
+                     ->IsStore());
 
   if (v8_flags.disable_write_barriers) return;
 
@@ -642,38 +630,45 @@ void LiftoffAssembler::Load(LiftoffRegister dst, Register src_addr,
   switch (type.value()) {
     case LoadType::kI32Load8U:
     case LoadType::kI64Load8U:
-      Ld_bu(dst.gp(), src_op);
+      Ld_bu(dst.gp(), src_op, reinterpret_cast<int*>(protected_load_pc));
       break;
     case LoadType::kI32Load8S:
     case LoadType::kI64Load8S:
-      Ld_b(dst.gp(), src_op);
+      Ld_b(dst.gp(), src_op, reinterpret_cast<int*>(protected_load_pc));
       break;
     case LoadType::kI32Load16U:
     case LoadType::kI64Load16U:
-      MacroAssembler::Ld_hu(dst.gp(), src_op);
+      MacroAssembler::Ld_hu(dst.gp(), src_op,
+                            reinterpret_cast<int*>(protected_load_pc));
       break;
     case LoadType::kI32Load16S:
     case LoadType::kI64Load16S:
-      MacroAssembler::Ld_h(dst.gp(), src_op);
+      MacroAssembler::Ld_h(dst.gp(), src_op,
+                           reinterpret_cast<int*>(protected_load_pc));
       break;
     case LoadType::kI64Load32U:
-      MacroAssembler::Ld_wu(dst.gp(), src_op);
+      MacroAssembler::Ld_wu(dst.gp(), src_op,
+                            reinterpret_cast<int*>(protected_load_pc));
       break;
     case LoadType::kI32Load:
     case LoadType::kI64Load32S:
-      MacroAssembler::Ld_w(dst.gp(), src_op);
+      MacroAssembler::Ld_w(dst.gp(), src_op,
+                           reinterpret_cast<int*>(protected_load_pc));
       break;
     case LoadType::kI64Load:
-      MacroAssembler::Ld_d(dst.gp(), src_op);
+      MacroAssembler::Ld_d(dst.gp(), src_op,
+                           reinterpret_cast<int*>(protected_load_pc));
       break;
     case LoadType::kF32Load:
-      MacroAssembler::Fld_s(dst.fp(), src_op);
+      MacroAssembler::Fld_s(dst.fp(), src_op,
+                            reinterpret_cast<int*>(protected_load_pc));
       break;
     case LoadType::kF32LoadF16:
       UNIMPLEMENTED();
       break;
     case LoadType::kF64Load:
-      MacroAssembler::Fld_d(dst.fp(), src_op);
+      MacroAssembler::Fld_d(dst.fp(), src_op,
+                            reinterpret_cast<int*>(protected_load_pc));
       break;
     case LoadType::kS128Load:
       UNREACHABLE();
@@ -681,10 +676,10 @@ void LiftoffAssembler::Load(LiftoffRegister dst, Register src_addr,
     default:
       UNREACHABLE();
   }
-  // protected_load_pc should be the address of the load/store instruction.
-  // The MacroAssembler load/store may contain some instructions for adjusting
-  // MemOperand, so use pc_offset - kInstrSize to locate.
-  if (protected_load_pc) *protected_load_pc = pc_offset() - kInstrSize;
+  DCHECK_IMPLIES(protected_load_pc != nullptr,
+                 Instruction::At(reinterpret_cast<uint8_t*>(*protected_load_pc +
+                                                            buffer_start_))
+                     ->IsLoad());
 }
 
 void LiftoffAssembler::Store(Register dst_addr, Register offset_reg,
@@ -699,27 +694,32 @@ void LiftoffAssembler::Store(Register dst_addr, Register offset_reg,
   switch (type.value()) {
     case StoreType::kI32Store8:
     case StoreType::kI64Store8:
-      St_b(src.gp(), dst_op);
+      St_b(src.gp(), dst_op, reinterpret_cast<int*>(protected_store_pc));
       break;
     case StoreType::kI32Store16:
     case StoreType::kI64Store16:
-      MacroAssembler::St_h(src.gp(), dst_op);
+      MacroAssembler::St_h(src.gp(), dst_op,
+                           reinterpret_cast<int*>(protected_store_pc));
       break;
     case StoreType::kI32Store:
     case StoreType::kI64Store32:
-      MacroAssembler::St_w(src.gp(), dst_op);
+      MacroAssembler::St_w(src.gp(), dst_op,
+                           reinterpret_cast<int*>(protected_store_pc));
       break;
     case StoreType::kI64Store:
-      MacroAssembler::St_d(src.gp(), dst_op);
+      MacroAssembler::St_d(src.gp(), dst_op,
+                           reinterpret_cast<int*>(protected_store_pc));
       break;
     case StoreType::kF32Store:
-      MacroAssembler::Fst_s(src.fp(), dst_op);
+      MacroAssembler::Fst_s(src.fp(), dst_op,
+                            reinterpret_cast<int*>(protected_store_pc));
       break;
     case StoreType::kF32StoreF16:
       UNIMPLEMENTED();
       break;
     case StoreType::kF64Store:
-      MacroAssembler::Fst_d(src.fp(), dst_op);
+      MacroAssembler::Fst_d(src.fp(), dst_op,
+                            reinterpret_cast<int*>(protected_store_pc));
       break;
     case StoreType::kS128Store:
       UNREACHABLE();
@@ -727,65 +727,69 @@ void LiftoffAssembler::Store(Register dst_addr, Register offset_reg,
     default:
       UNREACHABLE();
   }
-  // protected_store_pc should be the address of the load/store instruction.
-  // The MacroAssembler load/store may contain some instructions for adjusting
-  // MemOperand, so use pc_offset - kInstrSize to locate.
-  if (protected_store_pc) *protected_store_pc = pc_offset() - kInstrSize;
+  DCHECK_IMPLIES(protected_store_pc != nullptr,
+                 Instruction::At(reinterpret_cast<uint8_t*>(
+                                     *protected_store_pc + buffer_start_))
+                     ->IsStore());
 }
 
 void LiftoffAssembler::AtomicLoad(LiftoffRegister dst, Register src_addr,
                                   Register offset_reg, uintptr_t offset_imm,
                                   LoadType type, uint32_t* protected_load_pc,
+                                  AtomicMemoryOrder memory_order,
                                   LiftoffRegList pinned, bool i64_offset,
                                   Endianness /* endianness */) {
+  DCHECK(memory_order == AtomicMemoryOrder::kSeqCst ||
+         memory_order == AtomicMemoryOrder::kAcqRel);
+  int dbar_hint = memory_order == AtomicMemoryOrder::kSeqCst ? 0x10 : 0x14;
   BlockTrampolinePoolScope block_trampoline_pool(this);
   UseScratchRegisterScope temps(this);
   MemOperand src_op =
       liftoff::GetMemOp(this, src_addr, offset_reg, offset_imm, i64_offset);
+
   switch (type.value()) {
     case LoadType::kI32Load8U:
     case LoadType::kI64Load8U: {
-      Ld_bu(dst.gp(), src_op);
-      dbar(0);
+      Ld_bu(dst.gp(), src_op, reinterpret_cast<int*>(protected_load_pc));
+      dbar(dbar_hint);
       break;
     }
     case LoadType::kI32Load16U:
     case LoadType::kI64Load16U: {
-      Ld_hu(dst.gp(), src_op);
-      dbar(0);
+      Ld_hu(dst.gp(), src_op, reinterpret_cast<int*>(protected_load_pc));
+      dbar(dbar_hint);
       break;
     }
     case LoadType::kI32Load: {
-      Ld_w(dst.gp(), src_op);
-      dbar(0);
+      Ld_w(dst.gp(), src_op, reinterpret_cast<int*>(protected_load_pc));
+      dbar(dbar_hint);
       break;
     }
     case LoadType::kI64Load32U: {
-      Ld_wu(dst.gp(), src_op);
-      dbar(0);
+      Ld_wu(dst.gp(), src_op, reinterpret_cast<int*>(protected_load_pc));
+      dbar(dbar_hint);
       break;
     }
     case LoadType::kI64Load: {
-      Ld_d(dst.gp(), src_op);
-      dbar(0);
+      Ld_d(dst.gp(), src_op, reinterpret_cast<int*>(protected_load_pc));
+      dbar(dbar_hint);
       break;
     }
     case LoadType::kI32Load8S:
-      Ld_b(dst.gp(), src_op);
-      dbar(0);
+      Ld_b(dst.gp(), src_op, reinterpret_cast<int*>(protected_load_pc));
+      dbar(dbar_hint);
       break;
     case LoadType::kI32Load16S:
-      Ld_h(dst.gp(), src_op);
-      dbar(0);
+      Ld_h(dst.gp(), src_op, reinterpret_cast<int*>(protected_load_pc));
+      dbar(dbar_hint);
       break;
     default:
       UNREACHABLE();
   }
-
-  // protected_load_pc should be the address of the load instruction.
-  // The MacroAssembler load may contain some instructions for adjusting
-  // MemOperand, so use pc_offset - kInstrSize * 2 to locate.
-  if (protected_load_pc) *protected_load_pc = pc_offset() - kInstrSize * 2;
+  DCHECK_IMPLIES(protected_load_pc != nullptr,
+                 Instruction::At(reinterpret_cast<uint8_t*>(*protected_load_pc +
+                                                            buffer_start_))
+                     ->IsLoad());
 }
 
 void LiftoffAssembler::AtomicLoadTaggedPointer(Register dst, Register src_addr,
@@ -794,85 +798,96 @@ void LiftoffAssembler::AtomicLoadTaggedPointer(Register dst, Register src_addr,
                                                AtomicMemoryOrder memory_order,
                                                uint32_t* protected_load_pc,
                                                bool needs_shift) {
+  DCHECK(memory_order == AtomicMemoryOrder::kSeqCst ||
+         memory_order == AtomicMemoryOrder::kAcqRel);
+  int dbar_hint = memory_order == AtomicMemoryOrder::kSeqCst ? 0x10 : 0x14;
   BlockTrampolinePoolScope block_trampoline_pool(this);
   MemOperand src_op = liftoff::GetMemOp(this, src_addr, offset_reg, offset_imm);
-  uint32_t pc_offset_of_load = 0;
 
 #if V8_COMPRESS_POINTERS
-  Ld_w(dst, src_op);
-  pc_offset_of_load = pc_offset() - kInstrSize;
-  dbar(0);
+  Ld_w(dst, src_op, reinterpret_cast<int*>(protected_load_pc));
+  dbar(dbar_hint);
   DecompressTagged(dst, dst);
 #else
-  Ld_d(dst, src_op);
-  pc_offset_of_load = pc_offset() - kInstrSize;
-  dbar(0);
+  Ld_d(dst, src_op, reinterpret_cast<int*>(protected_load_pc));
+  dbar(dbar_hint);
 #endif
-  if (protected_load_pc != nullptr) {
-    *protected_load_pc = pc_offset_of_load;
-  }
+  DCHECK_IMPLIES(protected_load_pc != nullptr,
+                 Instruction::At(reinterpret_cast<uint8_t*>(*protected_load_pc +
+                                                            buffer_start_))
+                     ->IsLoad());
 }
 
 void LiftoffAssembler::AtomicStore(Register dst_addr, Register offset_reg,
                                    uintptr_t offset_imm, LiftoffRegister src,
                                    StoreType type, uint32_t* protected_store_pc,
+                                   AtomicMemoryOrder memory_order,
                                    LiftoffRegList pinned, bool i64_offset,
                                    Endianness /* endianness */) {
+  DCHECK(memory_order == AtomicMemoryOrder::kSeqCst ||
+         memory_order == AtomicMemoryOrder::kAcqRel);
+  int dbar_hint = memory_order == AtomicMemoryOrder::kSeqCst ? 0x10 : 0x12;
   BlockTrampolinePoolScope block_trampoline_pool(this);
   UseScratchRegisterScope temps(this);
   MemOperand dst_op =
       liftoff::GetMemOp(this, dst_addr, offset_reg, offset_imm, i64_offset);
+
   switch (type.value()) {
     case StoreType::kI64Store8:
     case StoreType::kI32Store8: {
-      dbar(0);
-      St_b(src.gp(), dst_op);
+      dbar(dbar_hint);
+      St_b(src.gp(), dst_op, reinterpret_cast<int*>(protected_store_pc));
       break;
     }
     case StoreType::kI64Store16:
     case StoreType::kI32Store16: {
-      dbar(0);
-      St_h(src.gp(), dst_op);
+      dbar(dbar_hint);
+      St_h(src.gp(), dst_op, reinterpret_cast<int*>(protected_store_pc));
       break;
     }
     case StoreType::kI64Store32:
     case StoreType::kI32Store: {
-      dbar(0);
-      St_w(src.gp(), dst_op);
+      dbar(dbar_hint);
+      St_w(src.gp(), dst_op, reinterpret_cast<int*>(protected_store_pc));
       break;
     }
     case StoreType::kI64Store: {
-      dbar(0);
-      St_d(src.gp(), dst_op);
+      dbar(dbar_hint);
+      St_d(src.gp(), dst_op, reinterpret_cast<int*>(protected_store_pc));
       break;
     }
     default:
       UNREACHABLE();
   }
-
-  // protected_store_pc should be the address of the store instruction.
-  // The MacroAssembler store may contain some instructions for adjusting
-  // MemOperand, so use pc_offset - kInstrSize to locate.
-  if (protected_store_pc) *protected_store_pc = pc_offset() - kInstrSize;
+  if (memory_order == AtomicMemoryOrder::kSeqCst) dbar(dbar_hint);
+  DCHECK_IMPLIES(protected_store_pc != nullptr,
+                 Instruction::At(reinterpret_cast<uint8_t*>(
+                                     *protected_store_pc + buffer_start_))
+                     ->IsStore());
 }
 
 void LiftoffAssembler::AtomicStoreTaggedPointer(
     Register dst_addr, Register offset_reg, int32_t offset_imm, Register src,
     LiftoffRegList pinned, AtomicMemoryOrder memory_order,
     uint32_t* protected_store_pc) {
+  DCHECK(memory_order == AtomicMemoryOrder::kSeqCst ||
+         memory_order == AtomicMemoryOrder::kAcqRel);
+  int dbar_hint = memory_order == AtomicMemoryOrder::kSeqCst ? 0x10 : 0x12;
   BlockTrampolinePoolScope block_trampoline_pool(this);
   MemOperand dst_op = liftoff::GetMemOp(this, dst_addr, offset_reg, offset_imm);
 
   if (COMPRESS_POINTERS_BOOL) {
-    dbar(0);
-    St_w(src, dst_op);
+    dbar(dbar_hint);
+    St_w(src, dst_op, reinterpret_cast<int*>(protected_store_pc));
   } else {
-    dbar(0);
-    St_d(src, dst_op);
+    dbar(dbar_hint);
+    St_d(src, dst_op, reinterpret_cast<int*>(protected_store_pc));
   }
-  if (protected_store_pc != nullptr) {
-    *protected_store_pc = pc_offset() - kInstrSize;
-  }
+  if (memory_order == AtomicMemoryOrder::kSeqCst) dbar(dbar_hint);
+  DCHECK_IMPLIES(protected_store_pc != nullptr,
+                 Instruction::At(reinterpret_cast<uint8_t*>(
+                                     *protected_store_pc + buffer_start_))
+                     ->IsStore());
 
   if (v8_flags.disable_write_barriers) return;
   // The write barrier.
@@ -907,8 +922,8 @@ void LiftoffAssembler::AtomicStoreTaggedPointer(
     slli_w(temp3, temp3, 3);                                            \
     dbar(0);                                                            \
     bind(&binop);                                                       \
-    if (protected_load_pc) *protected_load_pc = pc_offset();            \
-    load_linked(temp1, MemOperand(temp0, 0));                           \
+    load_linked(temp1, MemOperand(temp0, 0),                            \
+                reinterpret_cast<int*>(protected_load_pc));             \
     ExtractBits(result.gp(), temp1, temp3, size, false);                \
     bin_instr(temp2, result.gp(), Operand(value.gp()));                 \
     InsertBits(temp1, temp2, temp3, size);                              \
@@ -963,6 +978,10 @@ void LiftoffAssembler::AtomicStoreTaggedPointer(
       default:                                                                 \
         UNREACHABLE();                                                         \
     }                                                                          \
+    DCHECK_IMPLIES(protected_load_pc != nullptr,                               \
+                   Instruction::At(reinterpret_cast<uint8_t*>(                 \
+                                       *protected_load_pc + buffer_start_))    \
+                       ->IsLoad());                                            \
   }
 
 ATOMIC_BINOP_CASE(Add, Add_w, Add_d, add)
@@ -975,8 +994,8 @@ ATOMIC_BINOP_CASE(Xor, Xor, Xor, xor)
     Label binop;                                                         \
     dbar(0);                                                             \
     bind(&binop);                                                        \
-    if (protected_load_pc) *protected_load_pc = pc_offset();             \
-    load_linked(result.gp(), MemOperand(temp0, 0));                      \
+    load_linked(result.gp(), MemOperand(temp0, 0),                       \
+                reinterpret_cast<int*>(protected_load_pc));              \
     bin_instr(temp1, result.gp(), Operand(value.gp()));                  \
     store_conditional(temp1, MemOperand(temp0, 0));                      \
     BranchShort(&binop, eq, temp1, Operand(zero_reg));                   \
@@ -1026,6 +1045,10 @@ void LiftoffAssembler::AtomicSub(Register dst_addr, Register offset_reg,
     default:
       UNREACHABLE();
   }
+  DCHECK_IMPLIES(protected_load_pc != nullptr,
+                 Instruction::At(reinterpret_cast<uint8_t*>(*protected_load_pc +
+                                                            buffer_start_))
+                     ->IsLoad());
 }
 #undef ASSEMBLE_ATOMIC_BINOP
 #undef ASSEMBLE_ATOMIC_BINOP_EXT
@@ -1040,8 +1063,8 @@ void LiftoffAssembler::AtomicSub(Register dst_addr, Register offset_reg,
     slli_w(temp1, temp1, 3);                                                 \
     dbar(0);                                                                 \
     bind(&exchange);                                                         \
-    if (protected_load_pc) *protected_load_pc = pc_offset();                 \
-    load_linked(temp2, MemOperand(temp0, 0));                                \
+    load_linked(temp2, MemOperand(temp0, 0),                                 \
+                reinterpret_cast<int*>(protected_load_pc));                  \
     ExtractBits(result.gp(), temp2, temp1, size, false);                     \
     InsertBits(temp2, value.gp(), temp1, size);                              \
     store_conditional(temp2, MemOperand(temp0, 0));                          \
@@ -1093,6 +1116,10 @@ void LiftoffAssembler::AtomicExchange(
     default:
       UNREACHABLE();
   }
+  DCHECK_IMPLIES(protected_load_pc != nullptr,
+                 Instruction::At(reinterpret_cast<uint8_t*>(*protected_load_pc +
+                                                            buffer_start_))
+                     ->IsLoad());
 }
 #undef ASSEMBLE_ATOMIC_EXCHANGE_INTEGER_EXT
 
@@ -1114,6 +1141,10 @@ void LiftoffAssembler::AtomicExchangeTaggedPointer(
       amswap_db_d(result.gp(), value.gp(), actual_addr);
     }
   }
+  DCHECK_IMPLIES(protected_load_pc != nullptr,
+                 Instruction::At(reinterpret_cast<uint8_t*>(*protected_load_pc +
+                                                            buffer_start_))
+                     ->IsLoad());
 
   if (v8_flags.disable_write_barriers) return;
   // Emit the write barrier.
@@ -1146,8 +1177,8 @@ void LiftoffAssembler::AtomicExchangeTaggedPointer(
     Label exit;                                                     \
     dbar(0);                                                        \
     bind(&compareExchange);                                         \
-    if (protected_load_pc) *protected_load_pc = pc_offset();        \
-    load_linked(result.gp(), MemOperand(temp0, 0));                 \
+    load_linked(result.gp(), MemOperand(temp0, 0),                  \
+                reinterpret_cast<int*>(protected_load_pc));         \
     BranchShort(&exit, ne, expected_reg, Operand(result.gp()));     \
     mov(temp2, new_value.gp());                                     \
     store_conditional(temp2, MemOperand(temp0, 0));                 \
@@ -1166,8 +1197,8 @@ void LiftoffAssembler::AtomicExchangeTaggedPointer(
     slli_w(temp1, temp1, 3);                                     \
     dbar(0);                                                     \
     bind(&compareExchange);                                      \
-    if (protected_load_pc) *protected_load_pc = pc_offset();     \
-    load_linked(temp2, MemOperand(temp0, 0));                    \
+    load_linked(temp2, MemOperand(temp0, 0),                     \
+                reinterpret_cast<int*>(protected_load_pc));      \
     ExtractBits(result.gp(), temp2, temp1, size, false);         \
     ExtractBits(temp2, expected_reg, zero_reg, size, false);     \
     BranchShort(&exit, ne, temp2, Operand(result.gp()));         \
@@ -1224,6 +1255,10 @@ void LiftoffAssembler::AtomicCompareExchange(
     default:
       UNREACHABLE();
   }
+  DCHECK_IMPLIES(protected_load_pc != nullptr,
+                 Instruction::At(reinterpret_cast<uint8_t*>(*protected_load_pc +
+                                                            buffer_start_))
+                     ->IsLoad());
 }
 #undef ASSEMBLE_ATOMIC_COMPARE_EXCHANGE_INTEGER
 #undef ASSEMBLE_ATOMIC_COMPARE_EXCHANGE_INTEGER_EXT
@@ -3598,6 +3633,11 @@ bool LiftoffAssembler::emit_f16x8_qfms(LiftoffRegister dst,
 }
 
 bool LiftoffAssembler::supports_f16_mem_access() { return false; }
+
+void LiftoffAssembler::set_trap_on_oob_mem64(Register index, uint64_t max_index,
+                                             Label* trap_label) {
+  Branch(trap_label, kUnsignedGreaterThanEqual, index, Operand(max_index));
+}
 
 void LiftoffAssembler::emit_inc_i32_at(Address address) {
   UseScratchRegisterScope temps(this);

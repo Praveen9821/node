@@ -25,9 +25,6 @@
 #endif
 #if V8_OS_AIX
 #include <sys/systemcfg.h>  // _system_configuration
-#ifndef POWER_8
-#define POWER_8 0x10000
-#endif
 #ifndef POWER_9
 #define POWER_9 0x20000
 #endif
@@ -403,6 +400,7 @@ bool CPU::StarboardDetectCPU() {
       has_lzcnt_ = features.x86.has_lzcnt;
       has_popcnt_ = features.x86.has_popcnt;
       has_f16c_ = features.x86.has_f16c;
+      // TODO(jiepan): Support APX_F on STARBOARD
       break;
     default:
       return false;
@@ -450,6 +448,7 @@ CPU::CPU()
       has_bmi2_(false),
       has_lzcnt_(false),
       has_popcnt_(false),
+      has_apx_f_(false),
       has_idiva_(false),
       has_neon_(false),
       has_thumb2_(false),
@@ -537,6 +536,7 @@ CPU::CPU()
     has_avx_vnni_int8_ = (cpu_info71[3] & 0x00000020) != 0;
     has_fma3_ = (cpu_info[2] & 0x00001000) != 0;
     has_f16c_ = (cpu_info[2] & 0x20000000) != 0;
+    has_apx_f_ = (cpu_info71[3] & 0x00200000) != 0;
     // CET shadow stack feature flag. See
     // https://en.wikipedia.org/wiki/CPUID#EAX=7,_ECX=0:_Extended_Features
     has_cetss_ = (cpu_info70[2] & 0x00000080) != 0;
@@ -975,8 +975,6 @@ CPU::CPU()
       part_ = kPPCPower10;
     } else if (strcmp(auxv_cpu_type, "power9") == 0) {
       part_ = kPPCPower9;
-    } else if (strcmp(auxv_cpu_type, "power8") == 0) {
-      part_ = kPPCPower8;
     }
   }
 
@@ -987,9 +985,6 @@ CPU::CPU()
       break;
     case POWER_9:
       part_ = kPPCPower9;
-      break;
-    case POWER_8:
-      part_ = kPPCPower8;
       break;
   }
 #endif  // V8_OS_AIX
